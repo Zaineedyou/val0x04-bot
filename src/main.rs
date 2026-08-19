@@ -39,9 +39,10 @@ async fn main() {
 
 	let discord_http: Arc<serenity::http::Http> = client.http.clone();
 
-	let bridge_task = tokio::spawn(bridge_server::run_bridge_server(
+	let server_task = tokio::spawn(bridge_server::run_server(
 		config.listen_port,
 		config.websocket_auth_token,
+		config.panel_access_token,
 		discord_http,
 		config.discord_channel_id,
 		outgoing_receiver,
@@ -53,5 +54,5 @@ async fn main() {
 		}
 	});
 
-	let _ = tokio::join!(bridge_task, discord_task);
+	let _ = tokio::join!(server_task, discord_task);
 }

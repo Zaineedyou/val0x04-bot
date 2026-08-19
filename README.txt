@@ -23,8 +23,14 @@ ID channel Discord tempat chat bridge berjalan.
 BRIDGE_WEBSOCKET_AUTH_TOKEN
 Token bebas yang lo tentukan sendiri (boleh string acak apa saja, semakin panjang semakin aman). Nilai ini HARUS SAMA PERSIS dengan yang nanti diisi di config mod Fabric (config/discordbridge.properties, field websocket-auth-token). Karena sekarang bot yang menentukan token (bukan mod yang generate otomatis), edit dulu file config mod itu dan ganti nilai websocket-auth-token dengan token yang sama seperti di sini.
 
+PANEL_ACCESS_TOKEN
+Token rahasia khusus untuk membuka panel operator web. Buat string acak yang berbeda dari BRIDGE_WEBSOCKET_AUTH_TOKEN. Token ini dipakai pada halaman panel dan tidak disimpan oleh browser.
+
 PORT
 TIDAK PERLU DI-SET MANUAL. Railway otomatis mengisi variable ini sendiri. Bot membaca env var ini untuk tahu di port mana harus listen.
+
+PANEL CHAT DISCORD
+Setelah deploy, buka https://domain-bot-lo/panel lalu masukkan PANEL_ACCESS_TOKEN. Panel ini mengirim teks langsung sebagai bot ke channel Discord yang sama dengan DISCORD_CHANNEL_ID. Endpoint WebSocket mod Fabric tetap berada di root domain, sehingga websocket-url mod tidak perlu diubah.
 
 CARA MOD FABRIC CONNECT KE BOT INI
 Di config/discordbridge.properties milik mod, set:

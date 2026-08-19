@@ -5,6 +5,7 @@ pub struct Config {
 	pub discord_channel_id: u64,
 	pub listen_port: u16,
 	pub websocket_auth_token: String,
+	pub panel_access_token: String,
 }
 
 impl Config {
@@ -28,11 +29,15 @@ impl Config {
 		let websocket_auth_token = env::var("BRIDGE_WEBSOCKET_AUTH_TOKEN")
 			.map_err(|_| "Environment variable BRIDGE_WEBSOCKET_AUTH_TOKEN belum di-set".to_string())?;
 
+		let panel_access_token = env::var("PANEL_ACCESS_TOKEN")
+			.map_err(|_| "Environment variable PANEL_ACCESS_TOKEN belum di-set".to_string())?;
+
 		Ok(Config {
 			discord_token,
 			discord_channel_id,
 			listen_port,
 			websocket_auth_token,
+			panel_access_token,
 		})
 	}
 }
