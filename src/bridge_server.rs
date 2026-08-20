@@ -136,6 +136,13 @@ async fn bridge_upgrade(
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
+    // Satu mod hanya memerlukan satu socket. Jangan menerima koneksi pengganti
+    // lalu menutup socket aktif, karena pola itu memicu loop reset/reconnect.
+    if state.active_writer.lock().await.is_some() {
+        println!("Koneksi bridge tambahan ditolak karena masih ada koneksi aktif.");
+        return StatusCode::CONFLICT.into_response();
+    }
+
     websocket
         .on_upgrade(move |socket| handle_connection(socket, state))
         .into_response()
@@ -147,20 +154,22 @@ async fn handle_connection(socket: WebSocket, state: AppState) {
     println!("Mod Fabric terhubung (koneksi #{connection_id}).");
 
     let (writer, mut reader) = socket.split();
-    let previous_writer = {
+    let accepted = {
         let mut guard = state.active_writer.lock().await;
-        guard
-            .replace(ActiveConnection {
+        if guard.is_some() {
+            false
+        } else {
+            *guard = Some(ActiveConnection {
                 id: connection_id,
                 writer,
-            })
-            .map(|connection| connection.writer)
+            });
+            true
+        }
     };
 
-    if let Some(mut previous_writer) = previous_writer {
-        if let Err(err) = previous_writer.send(WsMessage::Close(None)).await {
-            eprintln!("Gagal menutup koneksi bridge sebelumnya: {err}");
-        }
+    if !accepted {
+        println!("Koneksi #{connection_id} ditutup karena koneksi lain sudah aktif.");
+        return;
     }
 
     let heartbeat_task = tokio::spawn(send_heartbeats(connection_id, state.active_writer.clone()));
@@ -186,7 +195,7 @@ async fn handle_connection(socket: WebSocket, state: AppState) {
     }
 
     heartbeat_task.abort();
-    close_connection_if_current(&state.active_writer, connection_id).await;
+    clear_connection_if_current(&state.active_writer, connection_id).await;
     println!("Mod Fabric terputus (koneksi #{connection_id}).");
 }
 
@@ -226,29 +235,6 @@ async fn clear_connection_if_current(active_writer: &ActiveWriter, connection_id
         .is_some_and(|connection| connection.id == connection_id)
     {
         *guard = None;
-    }
-}
-
-async fn close_connection_if_current(
-    active_writer: &ActiveWriter,
-    connection_id: u64,
-) {
-    let writer = {
-        let mut guard = active_writer.lock().await;
-        if guard
-            .as_ref()
-            .is_some_and(|connection| connection.id == connection_id)
-        {
-            guard.take().map(|connection| connection.writer)
-        } else {
-            None
-        }
-    };
-
-    if let Some(mut writer) = writer {
-        if let Err(err) = writer.send(WsMessage::Close(None)).await {
-            eprintln!("Gagal menyelesaikan penutupan koneksi #{connection_id}: {err}");
-        }
     }
 }
 
