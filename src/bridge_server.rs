@@ -10,10 +10,10 @@ use serenity::http::Http;
 use serenity::model::id::ChannelId;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::embed_builder::send_bridge_event;
@@ -22,12 +22,15 @@ use crate::protocol::{IncomingEvent, OutgoingChatMessage};
 type WsWriter = SplitSink<WebSocket, WsMessage>;
 type ActiveWriter = Arc<Mutex<Option<ActiveConnection>>>;
 
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+const STALE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(75);
 const MAX_DISCORD_MESSAGE_LENGTH: usize = 2_000;
 
 struct ActiveConnection {
     id: u64,
     writer: WsWriter,
+    last_seen: Instant,
+    shutdown: watch::Sender<bool>,
 }
 
 #[derive(Clone)]
@@ -136,10 +139,8 @@ async fn bridge_upgrade(
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    // Satu mod hanya memerlukan satu socket. Jangan menerima koneksi pengganti
-    // lalu menutup socket aktif, karena pola itu memicu loop reset/reconnect.
-    if state.active_writer.lock().await.is_some() {
-        println!("Koneksi bridge tambahan ditolak karena masih ada koneksi aktif.");
+    if !prepare_for_new_connection(&state.active_writer).await {
+        println!("Koneksi bridge tambahan ditolak karena koneksi aktif masih sehat.");
         return StatusCode::CONFLICT.into_response();
     }
 
@@ -154,43 +155,62 @@ async fn handle_connection(socket: WebSocket, state: AppState) {
     println!("Mod Fabric terhubung (koneksi #{connection_id}).");
 
     let (writer, mut reader) = socket.split();
-    let accepted = {
-        let mut guard = state.active_writer.lock().await;
-        if guard.is_some() {
-            false
-        } else {
-            *guard = Some(ActiveConnection {
-                id: connection_id,
-                writer,
-            });
-            true
-        }
-    };
+    let (shutdown, mut shutdown_receiver) = watch::channel(false);
+    let accepted = claim_connection(
+        &state.active_writer,
+        ActiveConnection {
+            id: connection_id,
+            writer,
+            last_seen: Instant::now(),
+            shutdown,
+        },
+    )
+    .await;
 
     if !accepted {
-        println!("Koneksi #{connection_id} ditutup karena koneksi lain sudah aktif.");
+        println!("Koneksi #{connection_id} ditolak karena koneksi lain masih sehat.");
         return;
     }
 
-    let heartbeat_task = tokio::spawn(send_heartbeats(connection_id, state.active_writer.clone()));
+    let heartbeat_task = tokio::spawn(send_heartbeats(
+        connection_id,
+        state.active_writer.clone(),
+        shutdown_receiver.clone(),
+    ));
 
-    while let Some(message) = reader.next().await {
-        match message {
-            Ok(WsMessage::Text(text)) => {
-                handle_incoming_from_mod(text.as_str(), &state.discord_http, state.discord_channel_id)
-                    .await;
-            }
-            Ok(WsMessage::Close(_)) => {
+    loop {
+        tokio::select! {
+            _ = shutdown_receiver.changed() => {
+                println!("Koneksi #{connection_id} dihentikan setelah dinyatakan stale.");
                 break;
             }
-            Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {
-                // tungstenite menjawab ping otomatis saat stream terus dipoll.
+            message = reader.next() => {
+                let Some(message) = message else {
+                    break;
+                };
+
+                if !touch_connection_if_current(&state.active_writer, connection_id).await {
+                    break;
+                }
+
+                match message {
+                    Ok(WsMessage::Text(text)) => {
+                        handle_incoming_from_mod(text.as_str(), &state.discord_http, state.discord_channel_id)
+                            .await;
+                    }
+                    Ok(WsMessage::Close(_)) => {
+                        break;
+                    }
+                    Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {
+                        // Axum/tungstenite menjawab ping otomatis ketika stream terus dipoll.
+                    }
+                    Err(err) => {
+                        eprintln!("Kesalahan koneksi dari mod (koneksi #{connection_id}): {err}");
+                        break;
+                    }
+                    _ => {}
+                }
             }
-            Err(err) => {
-                eprintln!("Kesalahan koneksi dari mod (koneksi #{connection_id}): {err}");
-                break;
-            }
-            _ => {}
         }
     }
 
@@ -199,13 +219,30 @@ async fn handle_connection(socket: WebSocket, state: AppState) {
     println!("Mod Fabric terputus (koneksi #{connection_id}).");
 }
 
-async fn send_heartbeats(connection_id: u64, active_writer: ActiveWriter) {
+async fn send_heartbeats(
+    connection_id: u64,
+    active_writer: ActiveWriter,
+    mut shutdown_receiver: watch::Receiver<bool>,
+) {
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await;
 
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = shutdown_receiver.changed() => return,
+            _ = ticker.tick() => {}
+        }
+
+        match connection_is_stale(&active_writer, connection_id).await {
+            Some(true) => {
+                eprintln!("Heartbeat timeout pada koneksi #{connection_id}; koneksi dibersihkan.");
+                deactivate_connection_if_current(&active_writer, connection_id).await;
+                return;
+            }
+            Some(false) => {}
+            None => return,
+        }
 
         let send_result = {
             let mut guard = active_writer.lock().await;
@@ -222,19 +259,92 @@ async fn send_heartbeats(connection_id: u64, active_writer: ActiveWriter) {
 
         if let Err(err) = send_result {
             eprintln!("Heartbeat WebSocket gagal pada koneksi #{connection_id}: {err}");
-            clear_connection_if_current(&active_writer, connection_id).await;
+            deactivate_connection_if_current(&active_writer, connection_id).await;
             return;
         }
     }
 }
 
-async fn clear_connection_if_current(active_writer: &ActiveWriter, connection_id: u64) {
+async fn prepare_for_new_connection(active_writer: &ActiveWriter) -> bool {
+    let stale_connection = {
+        let mut guard = active_writer.lock().await;
+        match guard.as_ref() {
+            Some(connection) if !is_stale(connection.last_seen, Instant::now()) => return false,
+            Some(_) => guard.take(),
+            None => None,
+        }
+    };
+
+    if let Some(connection) = stale_connection {
+        println!("Koneksi #{} stale; menyiapkan takeover aman.", connection.id);
+        let _ = connection.shutdown.send(true);
+    }
+
+    true
+}
+
+async fn claim_connection(active_writer: &ActiveWriter, candidate: ActiveConnection) -> bool {
+    let stale_connection = {
+        let mut guard = active_writer.lock().await;
+        match guard.as_ref() {
+            Some(connection) if !is_stale(connection.last_seen, Instant::now()) => return false,
+            _ => guard.replace(candidate),
+        }
+    };
+
+    if let Some(connection) = stale_connection {
+        println!("Koneksi #{} stale; diganti oleh koneksi baru.", connection.id);
+        let _ = connection.shutdown.send(true);
+    }
+
+    true
+}
+
+async fn touch_connection_if_current(active_writer: &ActiveWriter, connection_id: u64) -> bool {
     let mut guard = active_writer.lock().await;
-    if guard
+    let Some(connection) = guard.as_mut() else {
+        return false;
+    };
+
+    if connection.id != connection_id {
+        return false;
+    }
+
+    connection.last_seen = Instant::now();
+    true
+}
+
+async fn connection_is_stale(active_writer: &ActiveWriter, connection_id: u64) -> Option<bool> {
+    let guard = active_writer.lock().await;
+    guard
         .as_ref()
-        .is_some_and(|connection| connection.id == connection_id)
-    {
-        *guard = None;
+        .filter(|connection| connection.id == connection_id)
+        .map(|connection| is_stale(connection.last_seen, Instant::now()))
+}
+
+fn is_stale(last_seen: Instant, now: Instant) -> bool {
+    now.duration_since(last_seen) >= STALE_CONNECTION_TIMEOUT
+}
+
+async fn clear_connection_if_current(active_writer: &ActiveWriter, connection_id: u64) {
+    deactivate_connection_if_current(active_writer, connection_id).await;
+}
+
+async fn deactivate_connection_if_current(active_writer: &ActiveWriter, connection_id: u64) {
+    let connection = {
+        let mut guard = active_writer.lock().await;
+        if guard
+            .as_ref()
+            .is_some_and(|connection| connection.id == connection_id)
+        {
+            guard.take()
+        } else {
+            None
+        }
+    };
+
+    if let Some(connection) = connection {
+        let _ = connection.shutdown.send(true);
     }
 }
 
@@ -386,6 +496,7 @@ const PANEL_HTML: &str = r#"<!doctype html>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn panel_rejects_empty_messages() {
@@ -404,5 +515,19 @@ mod tests {
             validate_operator_message(&too_long),
             Err("Pesan maksimal 2.000 karakter.")
         );
+    }
+
+    #[test]
+    fn fresh_connection_is_not_stale() {
+        let now = Instant::now();
+        let last_seen = now - (STALE_CONNECTION_TIMEOUT - Duration::from_secs(1));
+        assert!(!is_stale(last_seen, now));
+    }
+
+    #[test]
+    fn expired_connection_is_stale() {
+        let now = Instant::now();
+        let last_seen = now - STALE_CONNECTION_TIMEOUT;
+        assert!(is_stale(last_seen, now));
     }
 }
